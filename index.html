@@ -17,10 +17,10 @@
       font-family: sans-serif;
       border-radius: 4px;
       z-index: 1000;
-      width: 240px;
+      width: 230px;
     }
     #panel input { width: 100%; margin-top: 5px; box-sizing: border-box; }
-    button { margin-top: 5px; width: 100%; }
+    button { margin-top: 5px; width: 100%; cursor: pointer; }
     #savedList {
       margin-top: 8px;
       font-size: 12px;
@@ -28,8 +28,18 @@
       overflow-y: auto;
     }
     .marker-label {
-      color: #fff; background: #0008; padding: 2px 6px;
-      border-radius: 3px; font-size: 12px;
+      color: #fff;
+      background: #0008;
+      padding: 2px 6px;
+      border-radius: 3px;
+      font-size: 12px;
+    }
+    .list-item {
+      cursor: pointer;
+      padding: 2px 0;
+    }
+    .list-item:hover {
+      text-decoration: underline;
     }
   </style>
 </head>
@@ -41,18 +51,14 @@
     <div id="status">Click two intersections (A→B)</div>
     <input id="roadName" type="text" placeholder="Enter name..." />
     <button id="saveBtn">Save</button>
+    <button id="clearBtn">Clear Selection</button>
     <button id="downloadBtn">Download JSON</button>
+    <button id="importBtn">Import JSON</button>
     <div id="savedList"></div>
   </div>
 
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script>
-  // ====== CONFIG ======
-  const GITHUB_TOKEN = "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";     
-  const REPO = "samgeekman/chernarus_road_map";       
-  const BRANCH = "main";
-  // ====================
-
   const map = L.map('map', {
     crs: L.CRS.Simple,
     minZoom: -3,
@@ -61,53 +67,17 @@
     zoom: 0
   });
 
+  // --- Correct base image overlay ---
+  const imageUrl = "chernarus_map.jpeg";
+  const imageBounds = [[-242.500, 222.671], [295, 818.329]];
+  L.imageOverlay(imageUrl, imageBounds).addTo(map);
+  map.fitBounds(imageBounds);
+
   function key(x,y){return `${x.toFixed(3)},${y.toFixed(3)}`;}
 
-  // --- GitHub fetch/save helpers ---
-  async function fetchFromGitHub() {
-    const url = `https://api.github.com/repos/${REPO}/contents/${FILE_PATH}?ref=${BRANCH}`;
-    const res = await fetch(url);
-    const data = await res.json();
-    if (!data.content) return [];
-    const decoded = decodeURIComponent(escape(atob(data.content)));
-    return JSON.parse(decoded);
-  }
-
-  async function saveToGitHub(updatedData) {
-    const apiURL = `https://api.github.com/repos/${REPO}/contents/${FILE_PATH}`;
-    const getResp = await fetch(apiURL, {
-      headers: { Authorization: `token ${GITHUB_TOKEN}` }
-    });
-    const meta = await getResp.json();
-
-    const content = btoa(unescape(encodeURIComponent(JSON.stringify(updatedData, null, 2))));
-    const payload = {
-      message: "Update roadnames.json",
-      content,
-      sha: meta.sha,
-      branch: BRANCH
-    };
-
-    const putResp = await fetch(apiURL, {
-      method: "PUT",
-      headers: {
-        Authorization: `token ${GITHUB_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(payload)
-    });
-
-    if (putResp.ok) {
-      console.log("✅ Saved to GitHub");
-    } else {
-      console.error("❌ GitHub save failed", await putResp.text());
-    }
-  }
-
-  // --- Main map logic ---
   fetch("roads.geojson")
     .then(r=>r.json())
-    .then(async data=>{
+    .then(data=>{
       const clone=structuredClone(data);
       const nodeMap={};
       clone.features.forEach((f,i)=>{
@@ -120,33 +90,64 @@
       });
 
       const roadsLayer=L.geoJSON(clone,{style:{color:"#ff5555",weight:8,opacity:0.25}}).addTo(map);
-      map.fitBounds(roadsLayer.getBounds());
 
-      let pointA=null, pointB=null, markers=[], currentSegs=null;
-      let highlight=null;
+      let pointA=null, pointB=null, highlight=null, markers=[], currentSegs=null;
+      const saved=JSON.parse(localStorage.getItem("roadNames")||"[]");
+
       const savedLayer=L.layerGroup().addTo(map);
-
-      // Load persistent roads
-      let saved = await fetchFromGitHub().catch(()=>[]);
       const listDiv=document.getElementById("savedList");
       const status=document.getElementById("status");
       const nameBox=document.getElementById("roadName");
 
+      // Store references for each saved road's tooltip
+      const roadRefs = {};
+
       function refreshList(){
-        listDiv.innerHTML=saved.map(r=>`<div>${r.name}</div>`).join("");
+        listDiv.innerHTML = saved.map((r,i)=>`<div class="list-item" data-index="${i}">${r.name}</div>`).join("");
+        // Add click handlers
+        document.querySelectorAll(".list-item").forEach(el=>{
+          el.onclick = () => {
+            const i = parseInt(el.dataset.index);
+            const ref = roadRefs[i];
+            if(ref){
+              map.fitBounds(ref.layer.getBounds(), {maxZoom: 3});
+              ref.tooltip.openOn(map);
+            }
+          };
+        });
       }
-      refreshList();
 
       function drawSavedRoads(){
         savedLayer.clearLayers();
-        saved.forEach(r=>{
-          const feats=r.segs.map(i=>clone.features[i]);
-          L.geoJSON(feats,{style:{color:"limegreen",weight:3,opacity:0.9}}).addTo(savedLayer);
+        Object.keys(roadRefs).forEach(k => delete roadRefs[k]);
+
+        saved.forEach((r, i)=>{
+          const feats=r.segs.map(si=>clone.features[si]);
+          const layer=L.geoJSON(feats,{
+            style:{color:"limegreen",weight:3,opacity:0.9}
+          }).addTo(savedLayer);
+
+          // Calculate centroid for tooltip
+          const coords = feats.flatMap(f=>f.geometry.coordinates);
+          const avgX = coords.reduce((a,c)=>a+c[0],0)/coords.length;
+          const avgY = coords.reduce((a,c)=>a+c[1],0)/coords.length;
+          const tooltip = L.tooltip({permanent:false, direction:"top"})
+            .setLatLng([avgY, avgX])
+            .setContent(`<strong>${r.name}</strong>`);
+
+          layer.on("click", () => {
+            tooltip.openOn(map);
+            map.panTo([avgY, avgX]);
+          });
+
+          // store reference for later list click
+          roadRefs[i] = { layer, tooltip };
         });
       }
+
+      refreshList();
       drawSavedRoads();
 
-      // --- Pathfinding (bounded) ---
       function findPathSafe(startKey,endKey,maxSteps=5000){
         const queue=[startKey],visited=new Set([startKey]),parent={};
         let steps=0;
@@ -214,35 +215,71 @@
         }
       });
 
-      // --- Save button ---
-      document.getElementById("saveBtn").onclick=async()=>{
+      document.getElementById("saveBtn").onclick=()=>{
         const name=nameBox.value.trim();
         if(!name||!currentSegs){status.innerText="Select A→B and enter name.";return;}
-        const entry={name,segs:currentSegs};
-        saved.push(entry);
+        saved.push({name,segs:currentSegs});
+        localStorage.setItem("roadNames",JSON.stringify(saved));
         refreshList();
         drawSavedRoads();
         nameBox.value="";
         currentSegs=null;
-        status.innerText="Saving to GitHub...";
+        status.innerText="Saved locally! Click new A→B";
         if(highlight){map.removeLayer(highlight);highlight=null;}
-
-        try {
-          await saveToGitHub(saved);
-          status.innerText="✅ Saved to GitHub! Click new A→B";
-        } catch (err) {
-          console.error(err);
-          status.innerText="❌ Failed to save to GitHub (check console)";
-        }
       };
 
-      // --- Download JSON ---
+      document.getElementById("clearBtn").onclick=()=>{
+        if(highlight){map.removeLayer(highlight);highlight=null;}
+        markers.forEach(m=>map.removeLayer(m));markers=[];
+        pointA=null; pointB=null; currentSegs=null;
+        status.innerText="Selection cleared. Click two intersections (A→B)";
+      };
+
       document.getElementById("downloadBtn").onclick=()=>{
         const blob=new Blob([JSON.stringify(saved,null,2)],{type:"application/json"});
         const url=URL.createObjectURL(blob);
         const a=document.createElement("a");
         a.href=url;a.download="roadnames.json";a.click();
         URL.revokeObjectURL(url);
+      };
+
+      document.getElementById("importBtn").onclick = () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "application/json";
+        input.onchange = e => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          reader.onload = evt => {
+            try {
+              const imported = JSON.parse(evt.target.result);
+              if (!Array.isArray(imported)) {
+                alert("Invalid file format. Expected an array of saved roads.");
+                return;
+              }
+              if (confirm(`Import ${imported.length} roads? (OK = Replace, Cancel = Merge)`)) {
+                localStorage.setItem("roadNames", JSON.stringify(imported));
+                saved.length = 0;
+                imported.forEach(r => saved.push(r));
+              } else {
+                const existingNames = new Set(saved.map(r => r.name));
+                imported.forEach(r => {
+                  if (!existingNames.has(r.name)) saved.push(r);
+                });
+                localStorage.setItem("roadNames", JSON.stringify(saved));
+              }
+              refreshList();
+              drawSavedRoads();
+              status.innerText = "✅ Imported road data successfully!";
+            } catch (err) {
+              console.error(err);
+              alert("Failed to parse JSON. Check console for details.");
+            }
+          };
+          reader.readAsText(file);
+        };
+        input.click();
       };
     })
     .catch(err=>console.error(err));
