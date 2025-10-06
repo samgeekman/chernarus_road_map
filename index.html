@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Chernarus Roads Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <style>
+    html, body, #map {
+      height: 100%;
+      margin: 0;
+      background: #2b2b2b;
+    }
+  </style>
+</head>
+
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    const map = L.map('map', {
+      crs: L.CRS.Simple,
+      minZoom: -3,
+      maxZoom: 6,
+      zoomSnap: 0.25,
+      center: [0, 0],
+      zoom: 0
+    });
+
+    // --- Helper: build a simple string key for coordinate nodes
+    function key(x, y) { return `${x.toFixed(3)},${y.toFixed(3)}`; }
+
+    fetch("roads.geojson")
+      .then(r => r.json())
+      .then(data => {
+        const clone = JSON.parse(JSON.stringify(data));
+
+        // 1️⃣ Build node index: which lines touch which points
+        const nodeMap = {};  // key -> [feature indexes]
+        clone.features.forEach((f, i) => {
+          const coords = f.geometry.coordinates;
+          const start = coords[0];
+          const end   = coords[coords.length - 1];
+          [start, end].forEach(([x, y]) => {
+            const k = key(x, y);
+            if (!nodeMap[k]) nodeMap[k] = [];
+            nodeMap[k].push(i);
+          });
+        });
+
+        // 2️⃣ Draw the roads with larger invisible hit area
+        const roadsLayer = L.geoJSON(clone, {
+          style: {
+            color: "#ff5555",
+            weight: 3,       // wide hit area
+            opacity: 0.8,   // semi-transparent so still looks fine
+            interactive: true
+          }
+        }).addTo(map);
+
+        map.fitBounds(roadsLayer.getBounds());
+
+        // 3️⃣ Add hover behaviour
+        let highlightLayer = null;
+
+        function getConnectedSegments(startIndex) {
+          const visited = new Set();
+          const queue = [startIndex];
+          while (queue.length > 0) {
+            const idx = queue.pop();
+            if (visited.has(idx)) continue;
+            visited.add(idx);
+            const f = clone.features[idx];
+            const c = f.geometry.coordinates;
+            const ends = [c[0], c[c.length - 1]];
+            for (const [x, y] of ends) {
+              const k = key(x, y);
+              const connected = nodeMap[k] || [];
+              // continue along simple links only
+              if (connected.length === 2) {
+                for (const ni of connected) {
+                  if (!visited.has(ni)) queue.push(ni);
+                }
+              }
+            }
+          }
+          return Array.from(visited);
+        }
+
+        roadsLayer.eachLayer(layer => {
+          // Add pointer feedback
+          layer.on("mouseover", e => {
+            document.body.style.cursor = "pointer";
+
+            if (highlightLayer) {
+              map.removeLayer(highlightLayer);
+              highlightLayer = null;
+            }
+
+            // Find the feature index
+            const index = clone.features.findIndex(
+              f => f.geometry === layer.feature.geometry
+            );
+            const connected = getConnectedSegments(index);
+            const groupFeatures = connected.map(i => clone.features[i]);
+
+            highlightLayer = L.geoJSON(groupFeatures, {
+              style: { color: "yellow", weight: 5, opacity: 1 }
+            }).addTo(map);
+          });
+
+          layer.on("mouseout", e => {
+            document.body.style.cursor = "default";
+            if (highlightLayer) {
+              map.removeLayer(highlightLayer);
+              highlightLayer = null;
+            }
+          });
+        });
+      })
+      .catch(err => console.error(err));
+  </script>
+</body>
+</html>
