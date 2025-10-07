@@ -48,7 +48,7 @@
 
   <div id="panel">
     <div><strong>Define Road:</strong></div>
-    <div id="status">Click two intersections (A→B)</div>
+    <div id="status">Click two road lines (A→B)</div>
     <input id="roadName" type="text" placeholder="Enter name..." />
     <button id="saveBtn">Save</button>
     <button id="clearBtn">Clear Selection</button>
@@ -67,9 +67,9 @@
     zoom: 0
   });
 
-  // --- Correct base image overlay ---
+  // --- Base image overlay ---
   const imageUrl = "chernarus_map.jpeg";
-  const imageBounds = [[-242.500, 222.671], [295, 818.329]];
+  const imageBounds = [[-242.500, 221.871], [295.500, 819.700]];
   L.imageOverlay(imageUrl, imageBounds).addTo(map);
   map.fitBounds(imageBounds);
 
@@ -78,8 +78,10 @@
   fetch("roads.geojson")
     .then(r=>r.json())
     .then(data=>{
-      const clone=structuredClone(data);
-      const nodeMap={};
+      const clone = structuredClone(data);
+      const nodeMap = {};
+
+      // Map all intersections
       clone.features.forEach((f,i)=>{
         const c=f.geometry.coordinates;
         const s=c[0], e=c[c.length-1];
@@ -89,7 +91,10 @@
         });
       });
 
-      const roadsLayer=L.geoJSON(clone,{style:{color:"#ff5555",weight:8,opacity:0.25}}).addTo(map);
+      // --- Main red roads layer ---
+      const roadsLayer = L.geoJSON(clone,{
+        style:{color:"#ff5555",weight:8,opacity:0.50}
+      }).addTo(map);
 
       let pointA=null, pointB=null, highlight=null, markers=[], currentSegs=null;
       const saved=JSON.parse(localStorage.getItem("roadNames")||"[]");
@@ -98,13 +103,10 @@
       const listDiv=document.getElementById("savedList");
       const status=document.getElementById("status");
       const nameBox=document.getElementById("roadName");
-
-      // Store references for each saved road's tooltip
-      const roadRefs = {};
+      const roadRefs={};
 
       function refreshList(){
         listDiv.innerHTML = saved.map((r,i)=>`<div class="list-item" data-index="${i}">${r.name}</div>`).join("");
-        // Add click handlers
         document.querySelectorAll(".list-item").forEach(el=>{
           el.onclick = () => {
             const i = parseInt(el.dataset.index);
@@ -120,27 +122,19 @@
       function drawSavedRoads(){
         savedLayer.clearLayers();
         Object.keys(roadRefs).forEach(k => delete roadRefs[k]);
-
         saved.forEach((r, i)=>{
           const feats=r.segs.map(si=>clone.features[si]);
-          const layer=L.geoJSON(feats,{
-            style:{color:"limegreen",weight:3,opacity:0.9}
-          }).addTo(savedLayer);
-
-          // Calculate centroid for tooltip
+          const layer=L.geoJSON(feats,{style:{color:"limegreen",weight:3,opacity:0.9}}).addTo(savedLayer);
           const coords = feats.flatMap(f=>f.geometry.coordinates);
           const avgX = coords.reduce((a,c)=>a+c[0],0)/coords.length;
           const avgY = coords.reduce((a,c)=>a+c[1],0)/coords.length;
           const tooltip = L.tooltip({permanent:false, direction:"top"})
             .setLatLng([avgY, avgX])
             .setContent(`<strong>${r.name}</strong>`);
-
           layer.on("click", () => {
             tooltip.openOn(map);
             map.panTo([avgY, avgX]);
           });
-
-          // store reference for later list click
           roadRefs[i] = { layer, tooltip };
         });
       }
@@ -162,10 +156,7 @@
             }
           }
         }
-        if(steps>=maxSteps){
-          console.warn("Path search exceeded limit, aborting to prevent freeze.");
-          return [];
-        }
+        if(steps>=maxSteps){console.warn("Search exceeded limit.");return [];}
         const path=[];let k=endKey;
         while(k){path.unshift(k);k=parent[k];}
         if(path[0]!==startKey)return[];
@@ -183,36 +174,46 @@
         markers.push(m);
       }
 
-      map.on("click",e=>{
-        const clicked=map.layerPointToLatLng(e.layerPoint);
-        const [x,y]=[clicked.lng,clicked.lat];
-        const nearest=Object.keys(nodeMap)
-          .map(k=>{const[nx,ny]=k.split(',').map(Number);
-                   return{k,d:Math.hypot(nx-x,ny-y)};})
-          .sort((a,b)=>a.d-b.d)[0];
-        if(!nearest)return;
+      // --- NEW: click directly on red roads to select nearest intersection ---
+      roadsLayer.eachLayer(layer => {
+        layer.on("click", e => {
+          const coords = e.target.feature.geometry.coordinates;
+          // Snap to nearest end of clicked road segment
+          const [x1, y1] = coords[0];
+          const [x2, y2] = coords[coords.length - 1];
 
-        if(!pointA){
-          pointA=nearest.k;markPoint(e.latlng,"A");
-          status.innerText="Select point B";
-        }else{
-          pointB=nearest.k;markPoint(e.latlng,"B");
-          setTimeout(()=>{
-            const segs=findPathSafe(pointA,pointB);
-            if(segs.length){
-              const feats=segs.map(i=>clone.features[i]);
-              if(highlight)map.removeLayer(highlight);
-              highlight=L.geoJSON(feats,{style:{color:"yellow",weight:4}}).addTo(map);
-              status.innerText="Enter name then Save";
-              currentSegs=segs;
-            }else{
-              status.innerText="No connection found or search limited.";
-              currentSegs=null;
-            }
-            pointA=null;pointB=null;
-            markers.forEach(m=>map.removeLayer(m));markers=[];
-          },10);
-        }
+          const distToStart = Math.hypot(e.latlng.lng - x1, e.latlng.lat - y1);
+          const distToEnd = Math.hypot(e.latlng.lng - x2, e.latlng.lat - y2);
+          const chosen = distToStart < distToEnd ? [x1, y1] : [x2, y2];
+
+          const chosenKey = key(chosen[0], chosen[1]);
+          const chosenLatLng = L.latLng(chosen[1], chosen[0]);
+
+          if(!pointA){
+            pointA = chosenKey;
+            markPoint(chosenLatLng,"A");
+            status.innerText="Select point B";
+          } else {
+            pointB = chosenKey;
+            markPoint(chosenLatLng,"B");
+
+            setTimeout(()=>{
+              const segs = findPathSafe(pointA, pointB);
+              if(segs.length){
+                const feats = segs.map(i=>clone.features[i]);
+                if(highlight) map.removeLayer(highlight);
+                highlight = L.geoJSON(feats,{style:{color:"yellow",weight:4}}).addTo(map);
+                status.innerText = "Enter name then Save";
+                currentSegs = segs;
+              } else {
+                status.innerText = "No connection found or search limited.";
+                currentSegs = null;
+              }
+              pointA = null; pointB = null;
+              markers.forEach(m=>map.removeLayer(m)); markers=[];
+            },10);
+          }
+        });
       });
 
       document.getElementById("saveBtn").onclick=()=>{
@@ -232,7 +233,7 @@
         if(highlight){map.removeLayer(highlight);highlight=null;}
         markers.forEach(m=>map.removeLayer(m));markers=[];
         pointA=null; pointB=null; currentSegs=null;
-        status.innerText="Selection cleared. Click two intersections (A→B)";
+        status.innerText="Selection cleared. Click two roads (A→B)";
       };
 
       document.getElementById("downloadBtn").onclick=()=>{
