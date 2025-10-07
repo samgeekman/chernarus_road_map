@@ -7,6 +7,8 @@
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
     html, body, #map { height: 100%; margin: 0; background: #2b2b2b; }
+    #map { will-change: transform; transform: translateZ(0); } /* smoother pan */
+
     #panel {
       position: absolute;
       top: 10px;
@@ -17,16 +19,19 @@
       font-family: sans-serif;
       border-radius: 4px;
       z-index: 1000;
-      width: 230px;
+      width: 240px;
     }
+
     #panel input { width: 100%; margin-top: 5px; box-sizing: border-box; }
     button { margin-top: 5px; width: 100%; cursor: pointer; }
+
     #savedList {
       margin-top: 8px;
       font-size: 12px;
       max-height: 200px;
       overflow-y: auto;
     }
+
     .marker-label {
       color: #fff;
       background: #0008;
@@ -34,13 +39,27 @@
       border-radius: 3px;
       font-size: 12px;
     }
+
     .list-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: rgba(255,255,255,0.05);
+      margin-bottom: 2px;
+      padding: 2px 5px;
+      border-radius: 3px;
+    }
+    .list-item:hover { background: rgba(255,255,255,0.1); }
+
+    .delete-btn {
+      background: none;
+      border: none;
+      color: #ff6666;
       cursor: pointer;
-      padding: 2px 0;
+      font-size: 14px;
+      margin-left: 5px;
     }
-    .list-item:hover {
-      text-decoration: underline;
-    }
+    .delete-btn:hover { color: #ff0000; }
   </style>
 </head>
 <body>
@@ -73,6 +92,9 @@
   L.imageOverlay(imageUrl, imageBounds).addTo(map);
   map.fitBounds(imageBounds);
 
+  // --- Canvas renderer for high performance ---
+  const canvasRenderer = L.canvas({ padding: 0.5 });
+
   function key(x,y){return `${x.toFixed(3)},${y.toFixed(3)}`;}
 
   fetch("roads.geojson")
@@ -81,7 +103,7 @@
       const clone = structuredClone(data);
       const nodeMap = {};
 
-      // Map all intersections
+      // Map intersections
       clone.features.forEach((f,i)=>{
         const c=f.geometry.coordinates;
         const s=c[0], e=c[c.length-1];
@@ -91,30 +113,53 @@
         });
       });
 
-      // --- Main red roads layer ---
+      // --- Red roads layer (canvas-rendered) ---
       const roadsLayer = L.geoJSON(clone,{
-        style:{color:"#ff5555",weight:8,opacity:0.50}
+        style:{color:"#ff5555",weight:8,opacity:0.25},
+        renderer: canvasRenderer
       }).addTo(map);
 
       let pointA=null, pointB=null, highlight=null, markers=[], currentSegs=null;
       const saved=JSON.parse(localStorage.getItem("roadNames")||"[]");
-
       const savedLayer=L.layerGroup().addTo(map);
       const listDiv=document.getElementById("savedList");
       const status=document.getElementById("status");
       const nameBox=document.getElementById("roadName");
       const roadRefs={};
 
+      // --- Hide roads while dragging for smoother interaction ---
+      map.on('movestart', ()=> roadsLayer.remove());
+      map.on('moveend', ()=> roadsLayer.addTo(map));
+
       function refreshList(){
-        listDiv.innerHTML = saved.map((r,i)=>`<div class="list-item" data-index="${i}">${r.name}</div>`).join("");
-        document.querySelectorAll(".list-item").forEach(el=>{
+        listDiv.innerHTML = saved.map((r,i)=>`
+          <div class="list-item" data-index="${i}">
+            <span class="road-name">${r.name}</span>
+            <button class="delete-btn" data-index="${i}" title="Delete ${r.name}">🗑️</button>
+          </div>
+        `).join("");
+
+        document.querySelectorAll(".road-name").forEach(el=>{
           el.onclick = () => {
-            const i = parseInt(el.dataset.index);
+            const i = parseInt(el.parentElement.dataset.index);
             const ref = roadRefs[i];
             if(ref){
               map.fitBounds(ref.layer.getBounds(), {maxZoom: 3});
               ref.tooltip.openOn(map);
             }
+          };
+        });
+
+        document.querySelectorAll(".delete-btn").forEach(btn=>{
+          btn.onclick = () => {
+            const idx = parseInt(btn.dataset.index);
+            const roadName = saved[idx].name;
+            if (!confirm(`Delete road "${roadName}"?`)) return;
+            saved.splice(idx, 1);
+            localStorage.setItem("roadNames", JSON.stringify(saved));
+            drawSavedRoads();
+            refreshList();
+            status.innerText = `🗑️ Deleted "${roadName}"`;
           };
         });
       }
@@ -124,17 +169,17 @@
         Object.keys(roadRefs).forEach(k => delete roadRefs[k]);
         saved.forEach((r, i)=>{
           const feats=r.segs.map(si=>clone.features[si]);
-          const layer=L.geoJSON(feats,{style:{color:"limegreen",weight:3,opacity:0.9}}).addTo(savedLayer);
+          const layer=L.geoJSON(feats,{
+            style:{color:"limegreen",weight:3,opacity:0.9},
+            renderer: canvasRenderer
+          }).addTo(savedLayer);
           const coords = feats.flatMap(f=>f.geometry.coordinates);
           const avgX = coords.reduce((a,c)=>a+c[0],0)/coords.length;
           const avgY = coords.reduce((a,c)=>a+c[1],0)/coords.length;
           const tooltip = L.tooltip({permanent:false, direction:"top"})
             .setLatLng([avgY, avgX])
             .setContent(`<strong>${r.name}</strong>`);
-          layer.on("click", () => {
-            tooltip.openOn(map);
-            map.panTo([avgY, avgX]);
-          });
+          layer.on("click", () => { tooltip.openOn(map); map.panTo([avgY, avgX]); });
           roadRefs[i] = { layer, tooltip };
         });
       }
@@ -142,31 +187,51 @@
       refreshList();
       drawSavedRoads();
 
-      function findPathSafe(startKey,endKey,maxSteps=5000){
-        const queue=[startKey],visited=new Set([startKey]),parent={};
+      // --- Safe async pathfinder ---
+      function findPathSafeAsync(startKey, endKey, callback, maxSteps=10000, maxTime=2000){
+        const queue=[startKey];
+        const visited=new Set([startKey]);
+        const parent={};
         let steps=0;
-        while(queue.length && steps<maxSteps){
-          const cur=queue.shift();steps++;
-          if(cur===endKey)break;
-          for(const idx of (nodeMap[cur]||[])){
-            const f=clone.features[idx],c=f.geometry.coordinates,ends=[c[0],c[c.length-1]];
-            for(const [x,y] of ends){
-              const k=key(x,y);
-              if(!visited.has(k)){visited.add(k);parent[k]=cur;queue.push(k);}
+        const startTime=performance.now();
+
+        function processChunk(){
+          const chunkSize=200; // nodes per frame
+          let processed=0;
+
+          while(queue.length && processed<chunkSize){
+            const cur=queue.shift(); steps++; processed++;
+            if(cur===endKey){
+              const path=[]; let k=endKey;
+              while(k){path.unshift(k);k=parent[k];}
+              const segs=[];
+              for(let i=0;i<path.length-1;i++){
+                const a=path[i],b=path[i+1];
+                const sa=nodeMap[a]||[],sb=nodeMap[b]||[];
+                segs.push(...sa.filter(x=>sb.includes(x)));
+              }
+              callback([...new Set(segs)]);
+              return;
+            }
+
+            for(const idx of (nodeMap[cur]||[])){
+              const f=clone.features[idx],c=f.geometry.coordinates,ends=[c[0],c[c.length-1]];
+              for(const [x,y] of ends){
+                const k=key(x,y);
+                if(!visited.has(k)){visited.add(k);parent[k]=cur;queue.push(k);}
+              }
             }
           }
+
+          if(queue.length){
+            if(steps>maxSteps || (performance.now()-startTime)>maxTime){
+              console.warn("Path search exceeded safe limit; stopping to avoid freeze.");
+              callback([]); return;
+            }
+            setTimeout(processChunk, 0);
+          } else callback([]);
         }
-        if(steps>=maxSteps){console.warn("Search exceeded limit.");return [];}
-        const path=[];let k=endKey;
-        while(k){path.unshift(k);k=parent[k];}
-        if(path[0]!==startKey)return[];
-        const segs=[];
-        for(let i=0;i<path.length-1;i++){
-          const a=path[i],b=path[i+1];
-          const sa=nodeMap[a]||[],sb=nodeMap[b]||[];
-          segs.push(...sa.filter(x=>sb.includes(x)));
-        }
-        return [...new Set(segs)];
+        processChunk();
       }
 
       function markPoint(latlng,label){
@@ -174,44 +239,41 @@
         markers.push(m);
       }
 
-      // --- NEW: click directly on red roads to select nearest intersection ---
-      roadsLayer.eachLayer(layer => {
-        layer.on("click", e => {
-          const coords = e.target.feature.geometry.coordinates;
-          // Snap to nearest end of clicked road segment
-          const [x1, y1] = coords[0];
-          const [x2, y2] = coords[coords.length - 1];
-
-          const distToStart = Math.hypot(e.latlng.lng - x1, e.latlng.lat - y1);
-          const distToEnd = Math.hypot(e.latlng.lng - x2, e.latlng.lat - y2);
-          const chosen = distToStart < distToEnd ? [x1, y1] : [x2, y2];
-
-          const chosenKey = key(chosen[0], chosen[1]);
-          const chosenLatLng = L.latLng(chosen[1], chosen[0]);
+      // --- Click roads to select endpoints ---
+      roadsLayer.eachLayer(layer=>{
+        layer.on("click",e=>{
+          const coords=e.target.feature.geometry.coordinates;
+          const [x1,y1]=coords[0];
+          const [x2,y2]=coords[coords.length-1];
+          const distToStart=Math.hypot(e.latlng.lng-x1,e.latlng.lat-y1);
+          const distToEnd=Math.hypot(e.latlng.lng-x2,e.latlng.lat-y2);
+          const chosen=distToStart<distToEnd?[x1,y1]:[x2,y2];
+          const chosenKey=key(chosen[0],chosen[1]);
+          const chosenLatLng=L.latLng(chosen[1],chosen[0]);
 
           if(!pointA){
-            pointA = chosenKey;
-            markPoint(chosenLatLng,"A");
+            pointA=chosenKey;markPoint(chosenLatLng,"A");
             status.innerText="Select point B";
           } else {
-            pointB = chosenKey;
-            markPoint(chosenLatLng,"B");
-
-            setTimeout(()=>{
-              const segs = findPathSafe(pointA, pointB);
+            pointB=chosenKey;markPoint(chosenLatLng,"B");
+            status.innerText="🔍 Searching path...";
+            findPathSafeAsync(pointA, pointB, (segs)=>{
               if(segs.length){
-                const feats = segs.map(i=>clone.features[i]);
-                if(highlight) map.removeLayer(highlight);
-                highlight = L.geoJSON(feats,{style:{color:"yellow",weight:4}}).addTo(map);
-                status.innerText = "Enter name then Save";
-                currentSegs = segs;
+                const feats=segs.map(i=>clone.features[i]);
+                if(highlight)map.removeLayer(highlight);
+                highlight=L.geoJSON(feats,{
+                  style:{color:"yellow",weight:4},
+                  renderer:canvasRenderer
+                }).addTo(map);
+                status.innerText="Enter name then Save";
+                currentSegs=segs;
               } else {
-                status.innerText = "No connection found or search limited.";
-                currentSegs = null;
+                status.innerText="No connection found or search limit reached.";
+                currentSegs=null;
               }
-              pointA = null; pointB = null;
-              markers.forEach(m=>map.removeLayer(m)); markers=[];
-            },10);
+              pointA=null;pointB=null;
+              markers.forEach(m=>map.removeLayer(m));markers=[];
+            });
           }
         });
       });
@@ -225,14 +287,14 @@
         drawSavedRoads();
         nameBox.value="";
         currentSegs=null;
-        status.innerText="Saved locally! Click new A→B";
+        status.innerText="💾 Saved locally! Click new A→B";
         if(highlight){map.removeLayer(highlight);highlight=null;}
       };
 
       document.getElementById("clearBtn").onclick=()=>{
         if(highlight){map.removeLayer(highlight);highlight=null;}
         markers.forEach(m=>map.removeLayer(m));markers=[];
-        pointA=null; pointB=null; currentSegs=null;
+        pointA=null;pointB=null;currentSegs=null;
         status.innerText="Selection cleared. Click two roads (A→B)";
       };
 
@@ -244,39 +306,29 @@
         URL.revokeObjectURL(url);
       };
 
-      document.getElementById("importBtn").onclick = () => {
-        const input = document.createElement("input");
-        input.type = "file";
-        input.accept = "application/json";
-        input.onchange = e => {
-          const file = e.target.files[0];
-          if (!file) return;
-          const reader = new FileReader();
-          reader.onload = evt => {
-            try {
-              const imported = JSON.parse(evt.target.result);
-              if (!Array.isArray(imported)) {
-                alert("Invalid file format. Expected an array of saved roads.");
-                return;
-              }
-              if (confirm(`Import ${imported.length} roads? (OK = Replace, Cancel = Merge)`)) {
-                localStorage.setItem("roadNames", JSON.stringify(imported));
-                saved.length = 0;
-                imported.forEach(r => saved.push(r));
+      document.getElementById("importBtn").onclick=()=>{
+        const input=document.createElement("input");
+        input.type="file";
+        input.accept="application/json";
+        input.onchange=e=>{
+          const file=e.target.files[0];
+          if(!file)return;
+          const reader=new FileReader();
+          reader.onload=evt=>{
+            try{
+              const imported=JSON.parse(evt.target.result);
+              if(!Array.isArray(imported)){alert("Invalid format.");return;}
+              if(confirm(`Import ${imported.length} roads? (OK=Replace, Cancel=Merge)`)){
+                localStorage.setItem("roadNames",JSON.stringify(imported));
+                saved.length=0;imported.forEach(r=>saved.push(r));
               } else {
-                const existingNames = new Set(saved.map(r => r.name));
-                imported.forEach(r => {
-                  if (!existingNames.has(r.name)) saved.push(r);
-                });
-                localStorage.setItem("roadNames", JSON.stringify(saved));
+                const existing=new Set(saved.map(r=>r.name));
+                imported.forEach(r=>{if(!existing.has(r.name))saved.push(r);});
+                localStorage.setItem("roadNames",JSON.stringify(saved));
               }
-              refreshList();
-              drawSavedRoads();
-              status.innerText = "✅ Imported road data successfully!";
-            } catch (err) {
-              console.error(err);
-              alert("Failed to parse JSON. Check console for details.");
-            }
+              refreshList();drawSavedRoads();
+              status.innerText="✅ Imported road data successfully!";
+            }catch(err){console.error(err);alert("Failed to parse JSON.");}
           };
           reader.readAsText(file);
         };
