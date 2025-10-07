@@ -98,6 +98,7 @@
       const clone = structuredClone(data);
       const nodeMap = {};
 
+      // Precompute intersection graph
       clone.features.forEach((f,i)=>{
         const c=f.geometry.coordinates;
         const s=c[0], e=c[c.length-1];
@@ -128,7 +129,6 @@
           </div>
         `).join("");
 
-        // Clicking road name focuses it
         document.querySelectorAll(".road-name").forEach(el=>{
           el.onclick = () => {
             const i = parseInt(el.parentElement.dataset.index);
@@ -140,13 +140,11 @@
           };
         });
 
-        // Deleting road
         document.querySelectorAll(".delete-btn").forEach(btn=>{
           btn.onclick = () => {
             const idx = parseInt(btn.dataset.index);
             const roadName = saved[idx].name;
             if (!confirm(`Delete road "${roadName}"?`)) return;
-
             saved.splice(idx, 1);
             localStorage.setItem("roadNames", JSON.stringify(saved));
             drawSavedRoads();
@@ -176,31 +174,55 @@
       refreshList();
       drawSavedRoads();
 
-      function findPathSafe(startKey,endKey,maxSteps=5000){
-        const queue=[startKey],visited=new Set([startKey]),parent={};
+      // === SAFE PATHFINDER (non-freezing BFS with time slicing) ===
+      function findPathSafeAsync(startKey, endKey, callback, maxSteps=10000, maxTime=2000){
+        const queue=[startKey];
+        const visited=new Set([startKey]);
+        const parent={};
         let steps=0;
-        while(queue.length && steps<maxSteps){
-          const cur=queue.shift();steps++;
-          if(cur===endKey)break;
-          for(const idx of (nodeMap[cur]||[])){
-            const f=clone.features[idx],c=f.geometry.coordinates,ends=[c[0],c[c.length-1]];
-            for(const [x,y] of ends){
-              const k=key(x,y);
-              if(!visited.has(k)){visited.add(k);parent[k]=cur;queue.push(k);}
+        const startTime=performance.now();
+
+        function processChunk(){
+          const chunkSize=200; // process 200 nodes per frame
+          let processed=0;
+
+          while(queue.length && processed<chunkSize){
+            const cur=queue.shift(); steps++; processed++;
+            if(cur===endKey){
+              const path=[]; let k=endKey;
+              while(k){path.unshift(k);k=parent[k];}
+              const segs=[];
+              for(let i=0;i<path.length-1;i++){
+                const a=path[i],b=path[i+1];
+                const sa=nodeMap[a]||[],sb=nodeMap[b]||[];
+                segs.push(...sa.filter(x=>sb.includes(x)));
+              }
+              callback([...new Set(segs)]);
+              return;
+            }
+
+            for(const idx of (nodeMap[cur]||[])){
+              const f=clone.features[idx],c=f.geometry.coordinates,ends=[c[0],c[c.length-1]];
+              for(const [x,y] of ends){
+                const k=key(x,y);
+                if(!visited.has(k)){visited.add(k);parent[k]=cur;queue.push(k);}
+              }
             }
           }
+
+          if(queue.length){
+            if(steps>maxSteps || (performance.now()-startTime)>maxTime){
+              console.warn("Path search exceeded safe limit; stopping to avoid freeze.");
+              callback([]); // abort safely
+              return;
+            }
+            setTimeout(processChunk, 0); // yield to browser
+          } else {
+            callback([]); // no path
+          }
         }
-        if(steps>=maxSteps){console.warn("Search exceeded limit.");return [];}
-        const path=[];let k=endKey;
-        while(k){path.unshift(k);k=parent[k];}
-        if(path[0]!==startKey)return[];
-        const segs=[];
-        for(let i=0;i<path.length-1;i++){
-          const a=path[i],b=path[i+1];
-          const sa=nodeMap[a]||[],sb=nodeMap[b]||[];
-          segs.push(...sa.filter(x=>sb.includes(x)));
-        }
-        return [...new Set(segs)];
+
+        processChunk();
       }
 
       function markPoint(latlng,label){
@@ -225,8 +247,8 @@
             status.innerText="Select point B";
           } else {
             pointB=chosenKey;markPoint(chosenLatLng,"B");
-            setTimeout(()=>{
-              const segs=findPathSafe(pointA,pointB);
+            status.innerText="🔍 Searching path...";
+            findPathSafeAsync(pointA, pointB, (segs)=>{
               if(segs.length){
                 const feats=segs.map(i=>clone.features[i]);
                 if(highlight)map.removeLayer(highlight);
@@ -234,12 +256,12 @@
                 status.innerText="Enter name then Save";
                 currentSegs=segs;
               } else {
-                status.innerText="No connection found or search limited.";
+                status.innerText="No connection found or search limit reached.";
                 currentSegs=null;
               }
               pointA=null;pointB=null;
               markers.forEach(m=>map.removeLayer(m));markers=[];
-            },10);
+            });
           }
         });
       });
